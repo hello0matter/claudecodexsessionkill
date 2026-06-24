@@ -1,0 +1,9 @@
+# 保存了 AI 后端设置，含明文 API Key，切勿提交
+config.json
+
+# 运行产物
+cleaner.log
+*.cleaned.jsonl
+*.bak
+*.tmp
+__pycache__/
