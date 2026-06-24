@@ -731,14 +731,14 @@ class App:
             row=1, column=4, sticky="w"
         )
 
-        pat = ttk.LabelFrame(self.root, text="拒绝/道德化措辞正则（每行一个）")
+        pat = ttk.LabelFrame(self.host, text="拒绝/道德化措辞正则（每行一个）")
         pat.pack(fill="x", **pad)
         self.pat_text = tk.Text(pat, height=5, wrap="none")
         self.pat_text.pack(fill="x", padx=6, pady=6)
         self.pat_text.insert("end", "\n".join(DEFAULT_REFUSAL_PATTERNS) + "\n")
 
         exc = ttk.LabelFrame(
-            self.root, text="排除规则（文件名或路径通配，每行一个，如 *.bak、*/archive/*）"
+            self.host, text="排除规则（文件名或路径通配，每行一个，如 *.bak、*/archive/*）"
         )
         exc.pack(fill="x", **pad)
         self.exc_text = tk.Text(exc, height=3, wrap="none")
@@ -747,7 +747,7 @@ class App:
 
         self._build_backend_panel(pad)
 
-        ctrl = ttk.Frame(self.root)
+        ctrl = ttk.Frame(self.host)
         ctrl.pack(fill="x", **pad)
         self.btn_start = ttk.Button(ctrl, text="开始监听", command=self._start)
         self.btn_start.pack(side="left")
@@ -762,9 +762,9 @@ class App:
         self.status = ttk.Label(ctrl, text="未运行")
         self.status.pack(side="left", padx=12)
 
-        logf = ttk.LabelFrame(self.root, text="日志")
+        logf = ttk.LabelFrame(self.host, text="日志")
         logf.pack(fill="both", expand=True, **pad)
-        self.log_text = tk.Text(logf, height=12, wrap="word", state="disabled")
+        self.log_text = tk.Text(logf, height=10, wrap="word", state="disabled")
         self.log_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
         sb = ttk.Scrollbar(logf, command=self.log_text.yview)
         sb.pack(side="right", fill="y", pady=6)
@@ -778,7 +778,7 @@ class App:
     # --- AI 后端面板 --------------------------------------------------- #
     def _build_backend_panel(self, pad: dict) -> None:
         cfg = self.cfg
-        bk = ttk.LabelFrame(self.root, text="AI 改写后端（不选则用正则兜底文本）")
+        bk = ttk.LabelFrame(self.host, text="AI 改写后端（不选则用正则兜底文本）")
         bk.pack(fill="x", **pad)
 
         self.var_backend = tk.StringVar(value=cfg.get("backend", "none"))
