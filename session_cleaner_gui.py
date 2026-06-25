@@ -113,7 +113,7 @@ DEFAULT_REFUSAL_PATTERNS: list[str] = [
     # —— 英文：道德化 / 政策 ——
     r"as\s+an?\s+AI(\s+language\s+model)?",
     r"against\s+my\s+(guidelines|programming|policies|principles)",
-    r"not\s+(?:appropriate|ethical|allowed|permitted)",
+    r"(?:it'?s|that'?s|this\s+is|it\s+is|i'?m|i\s+am)\s+not\s+(?:appropriate|ethical)\b",
     r"I\s+can'?t\s+(?:in\s+good\s+conscience|provide|assist\s+with)",
 ]
 
@@ -165,14 +165,66 @@ class Cleaner:
         strip_thinking: bool,
         rewriter: Callable[[str], str] | None,
         log: Callable[[str, str], None],
+        include_user: bool = False,
+        max_ai_calls: int = 0,
+        user_ai_only: bool = False,
     ) -> None:
         self.regexes = [(p, re.compile(p, re.IGNORECASE)) for p in patterns]
         self.strip_thinking = strip_thinking
         self.rewriter = rewriter
         self.log = log
+        self.include_user = include_user  # 是否也处理 user 记录（粘贴/回放内容）
+        self.user_ai_only = user_ai_only  # user 记录仅处理被判定为 AI 回放的
         # 统计：正则命中次数、被删思考块/字段数。
         self.pattern_hits: dict[str, int] = {}
         self.thinking_removed = 0
+        # 本行处理产生的明细（每次 clean_line 开头清空），供详细日志使用
+        self.details: list[str] = []
+        # 省 token：改写结果缓存（相同片段只调一次 AI）+ AI 调用次数及上限
+        self.rewrite_cache: dict[str, str] = {}
+        self.ai_calls = 0
+        self.max_ai_calls = max_ai_calls  # <=0 表示不限
+        self._ai_limit_warned = False
+
+    @staticmethod
+    def _snip(text: str, n: int = 80) -> str:
+        """把多行/超长文本压成一行短预览，便于日志单行展示。"""
+        s = " ".join(str(text).split())
+        return s if len(s) <= n else s[:n] + "…"
+
+    # AI（Codex/Claude）回放内容的特征：命中其一即认为这条 user 记录是 AI 输出回放
+    _AI_REPLAY_SIGNALS = [
+        re.compile(r"Thought\s+for\s+\d+\s*s", re.IGNORECASE),
+        re.compile(r"\bThinking\b\.{0,3}", re.IGNORECASE),
+        re.compile(r"read\s+\d+\s+files?", re.IGNORECASE),
+        re.compile(r"ctrl\+o\s+to\s+expand", re.IGNORECASE),
+        re.compile(r"codex+\s+--yolo", re.IGNORECASE),
+        re.compile(r"[╭╮╰╯│─┌┐└┘├┤]"),  # TUI 面板框线
+        re.compile(r"\*\*[^*\n]{2,40}\*\*"),  # **小标题** 这种助手分段
+        re.compile(r"\b(tokens?\s+used|context\s+left)\b", re.IGNORECASE),
+    ]
+
+    def _looks_like_ai_replay(self, text: str) -> bool:
+        return any(rx.search(text) for rx in self._AI_REPLAY_SIGNALS)
+
+    def _content_text(self, content: Any) -> str:
+        """把 content（str 或 block 列表）拼成纯文本，用于整条特征判定。"""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for b in content:
+                if isinstance(b, dict):
+                    for k in ("text", "thinking", "summary"):
+                        if isinstance(b.get(k), str):
+                            parts.append(b[k])
+                elif isinstance(b, str):
+                    parts.append(b)
+            return "\n".join(parts)
+        return ""
+
+    def _matched_pats(self, text: str) -> list[str]:
+        return [p for p, rx in self.regexes if rx.search(text)]
 
     # --- 文本级 ---------------------------------------------------------- #
     def _matches_refusal(self, text: str) -> bool:
@@ -183,21 +235,90 @@ class Cleaner:
                 hit = True
         return hit
 
-    def _rewrite_text(self, text: str) -> tuple[str, bool]:
-        """返回 (新文本, 是否改动)。"""
+    def _rewrite_text(self, text: str, where: str = "") -> tuple[str, bool]:
+        """返回 (新文本, 是否改动)。where 标注是正文还是思考块，用于明细日志。"""
         if not text or not self._matches_refusal(text):
             return text, False
         # 已经是兜底文本，别重复改
         if text.strip() == FALLBACK_REPLACEMENT:
             return text, False
+
+        # 长文本（多句）只替换命中拒绝词的句子，保留其余内容，避免把一大段
+        # 粘贴/回放内容整体抹成一句兜底。短文本（单句拒绝）才整体替换。
+        sentences = self._split_sentences(text)
+        if len(sentences) > 1:
+            return self._rewrite_per_sentence(text, sentences, where)
+        return self._rewrite_whole(text, where)
+
+    # 句子切分：在中英文句末标点和换行后断句，保留分隔符
+    _SENT_SPLIT = re.compile(r"(?<=[。！？!?\n])")
+
+    def _split_sentences(self, text: str) -> list[str]:
+        parts = [s for s in self._SENT_SPLIT.split(text) if s]
+        return parts
+
+    def _rewrite_one(self, seg: str) -> str | None:
+        """改写单个命中片段，返回新文本；AI 失败/超限/无改写器则用兜底。None 表示未命中。"""
+        if not seg.strip() or not any(rx.search(seg) for _p, rx in self.regexes):
+            return None
+        if seg.strip() == FALLBACK_REPLACEMENT:
+            return None
+        key = seg.strip()
+        # 缓存命中：相同片段不再调 AI
+        if key in self.rewrite_cache:
+            return self.rewrite_cache[key]
         if self.rewriter is not None:
-            try:
-                new = self.rewriter(text)
-                if new and new.strip():
-                    return new, True
-            except Exception as exc:  # AI 失败 -> 退回正则兜底
-                self.log("WARN", f"AI 改写失败，使用兜底文本: {exc}")
-        return FALLBACK_REPLACEMENT, True
+            # AI 调用次数上限：超过则转纯正则兜底
+            if self.max_ai_calls > 0 and self.ai_calls >= self.max_ai_calls:
+                if not self._ai_limit_warned:
+                    self._ai_limit_warned = True
+                    self.log(
+                        "WARN",
+                        f"AI 改写已达上限 {self.max_ai_calls} 次，其余改动转纯正则兜底。",
+                    )
+            else:
+                try:
+                    self.ai_calls += 1
+                    new = self.rewriter(seg)
+                    if new and new.strip():
+                        self.rewrite_cache[key] = new
+                        return new
+                except Exception as exc:
+                    self.log("WARN", f"AI 改写失败，使用兜底文本: {exc}")
+        self.rewrite_cache[key] = FALLBACK_REPLACEMENT
+        return FALLBACK_REPLACEMENT
+
+    def _rewrite_per_sentence(
+        self, text: str, sentences: list[str], where: str
+    ) -> tuple[str, bool]:
+        changed = False
+        out: list[str] = []
+        for seg in sentences:
+            new = self._rewrite_one(seg)
+            if new is None:
+                out.append(seg)
+                continue
+            changed = True
+            pats = "、".join(p for p, rx in self.regexes if rx.search(seg)) or "?"
+            tail = " AI" if self.rewriter and new != FALLBACK_REPLACEMENT else " 兜底"
+            self.details.append(
+                f"改写[{where}·句]{tail} 命中『{pats}』：{self._snip(seg)} → {self._snip(new)}"
+            )
+            # 保留原句尾的换行（若有），让替换后排版不塌
+            trailing = "\n" if seg.endswith("\n") and not new.endswith("\n") else ""
+            out.append(new + trailing)
+        return "".join(out), changed
+
+    def _rewrite_whole(self, text: str, where: str) -> tuple[str, bool]:
+        pats = "、".join(self._matched_pats(text)) or "?"
+        new = self._rewrite_one(text)
+        if new is None:
+            return text, False
+        tail = " AI" if self.rewriter and new != FALLBACK_REPLACEMENT else " 兜底"
+        self.details.append(
+            f"改写[{where}]{tail} 命中『{pats}』：{self._snip(text)} → {self._snip(new)}"
+        )
+        return new, True
 
     # --- 结构级 ---------------------------------------------------------- #
     def _is_thinking_block(self, obj: Any) -> bool:
@@ -211,7 +332,7 @@ class Cleaner:
         if not isinstance(content, list):
             # 少数情况 content 直接是字符串（纯文本回复）
             if isinstance(content, str):
-                return self._rewrite_text(content)
+                return self._rewrite_text(content, "正文")
             return content, False
 
         changed = False
@@ -221,12 +342,22 @@ class Cleaner:
             if self.strip_thinking and self._is_thinking_block(item):
                 changed = True
                 self.thinking_removed += 1
+                bt = str(item.get("type", "")).lower() if isinstance(item, dict) else "?"
+                snip = ""
+                if isinstance(item, dict):
+                    for k in ("thinking", "summary", "text"):
+                        if isinstance(item.get(k), str):
+                            snip = self._snip(item[k], 60)
+                            break
+                self.details.append(f"删思考块[{bt}] {snip}")
                 continue
             if isinstance(item, dict):
                 btype = str(item.get("type", "")).lower()
-                # 可见回复正文
-                if btype == "text" and isinstance(item.get("text"), str):
-                    nt, c = self._rewrite_text(item["text"])
+                # 可见回复正文（Claude: text；Codex: output_text/input_text）
+                if btype in ("text", "output_text", "input_text") and isinstance(
+                    item.get("text"), str
+                ):
+                    nt, c = self._rewrite_text(item["text"], "正文")
                     if c:
                         item = {**item, "text": nt}
                         changed = True
@@ -234,7 +365,7 @@ class Cleaner:
                 elif btype in THINKING_BLOCK_TYPES:
                     for key in ("thinking", "summary", "text"):
                         if isinstance(item.get(key), str):
-                            nt, c = self._rewrite_text(item[key])
+                            nt, c = self._rewrite_text(item[key], f"思考.{key}")
                             if c:
                                 item = {**item, key: nt}
                                 changed = True
@@ -242,7 +373,8 @@ class Cleaner:
         return new_list, changed
 
     def clean_line(self, line: str) -> tuple[str, bool]:
-        """处理一行原始文本。只改 assistant 回复，元数据一律不碰。解析失败原样返回。"""
+        """处理一行原始文本。改 assistant 回复（及可选的 user 记录）。元数据一律不碰。"""
+        self.details = []  # 每行重置明细
         stripped = line.strip()
         if not stripped:
             return line, False
@@ -252,14 +384,42 @@ class Cleaner:
             # 半行 / 非 JSON：保留，等下次完整再处理
             return line, False
 
-        # 只认 assistant 记录
-        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+        if not isinstance(obj, dict):
             return line, False
+        rtype = obj.get("type")
+
+        # --- Codex rollout 格式：内容在 payload 里，无顶层 message ---------- #
+        payload = obj.get("payload")
+        if isinstance(payload, dict) and not isinstance(obj.get("message"), dict):
+            return self._clean_codex(obj, payload, line)
+
         message = obj.get("message")
-        if not isinstance(message, dict) or message.get("role") != "assistant":
+        if not isinstance(message, dict):
+            return line, False
+        role = message.get("role")
+
+        # 允许的记录：assistant 回复；以及（可选）user 记录（粘贴/回放内容）
+        is_assistant = rtype == "assistant" and role == "assistant"
+        is_user = rtype == "user" and role == "user"
+        if is_assistant:
+            new_content, changed = self._clean_content_blocks(message.get("content"))
+        elif is_user and self.include_user:
+            content = message.get("content")
+            # 仅改 AI 回放：整条记录不含 AI 回放特征则跳过，保护你自己输入的话
+            if self.user_ai_only and not self._looks_like_ai_replay(
+                self._content_text(content)
+            ):
+                return line, False
+            # user 记录不删思考块，只改其中的拒绝措辞
+            saved = self.strip_thinking
+            self.strip_thinking = False
+            try:
+                new_content, changed = self._clean_content_blocks(content)
+            finally:
+                self.strip_thinking = saved
+        else:
             return line, False
 
-        new_content, changed = self._clean_content_blocks(message.get("content"))
         if not changed:
             return line, False
 
@@ -267,9 +427,55 @@ class Cleaner:
         obj = {**obj, "message": message}
         return json.dumps(obj, ensure_ascii=False), True
 
+    def _clean_codex(self, obj: dict, payload: dict, line: str) -> tuple[str, bool]:
+        """处理 Codex rollout 行。助手正文分布在 payload 的多种 type 里。"""
+        ptype = str(payload.get("type", "")).lower()
+        changed = False
 
-# --------------------------------------------------------------------------- #
-# AI 改写器
+        if ptype == "message":
+            role = payload.get("role")
+            content = payload.get("content")
+            if role == "assistant":
+                new_content, changed = self._clean_content_blocks(content)
+            elif role == "user" and self.include_user:
+                # 仅改 AI 回放：整条不含 AI 回放特征则跳过，保护你自己输入的话
+                if self.user_ai_only and not self._looks_like_ai_replay(
+                    self._content_text(content)
+                ):
+                    return line, False
+                saved = self.strip_thinking
+                self.strip_thinking = False
+                try:
+                    new_content, changed = self._clean_content_blocks(content)
+                finally:
+                    self.strip_thinking = saved
+            else:
+                return line, False  # developer/system 等不碰
+            if changed:
+                payload = {**payload, "content": new_content}
+
+        elif ptype == "agent_message":
+            # 助手可见回复（event_msg）
+            msg = payload.get("message")
+            if isinstance(msg, str):
+                nt, changed = self._rewrite_text(msg, "正文")
+                if changed:
+                    payload = {**payload, "message": nt}
+
+        elif ptype == "task_complete":
+            # 本轮最后一条助手消息
+            msg = payload.get("last_agent_message")
+            if isinstance(msg, str):
+                nt, changed = self._rewrite_text(msg, "正文")
+                if changed:
+                    payload = {**payload, "last_agent_message": nt}
+
+        # 其它 payload 类型（reasoning/token_count/turn_context…）一律不碰
+
+        if not changed:
+            return line, False
+        obj = {**obj, "payload": payload}
+        return json.dumps(obj, ensure_ascii=False), True
 # --------------------------------------------------------------------------- #
 def make_ai_rewriter(
     log: Callable[[str, str], None]
@@ -293,7 +499,7 @@ def make_ai_rewriter(
     def rewrite(text: str) -> str:
         resp = client.messages.create(
             model=model,
-            max_tokens=1024,
+            max_tokens=256,
             system=system,
             messages=[{"role": "user", "content": text}],
         )
@@ -323,8 +529,10 @@ def make_openai_rewriter(
     if not url.endswith("/chat/completions"):
         url = url + "/chat/completions"
     system = prompt or DEFAULT_REWRITE_PROMPT
+    # 实际使用的 url（可能因 https 协议错误自动回退到 http）
+    state = {"url": url, "fell_back": False}
 
-    def rewrite(text: str) -> str:
+    def _post(target: str, text: str) -> str:
         body = json.dumps(
             {
                 "model": model,
@@ -332,12 +540,12 @@ def make_openai_rewriter(
                     {"role": "system", "content": system},
                     {"role": "user", "content": text},
                 ],
-                "max_tokens": 1024,
+                "max_tokens": 256,
                 "temperature": 0.7,
             }
         ).encode("utf-8")
         req = urllib.request.Request(
-            url,
+            target,
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -345,9 +553,29 @@ def make_openai_rewriter(
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=18) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"].strip()
+
+    def _is_ssl_proto_error(exc: Exception) -> bool:
+        # https 打到了 http 明文端口时，urllib 抛 URLError(SSLError: WRONG_VERSION_NUMBER)
+        msg = str(getattr(exc, "reason", exc))
+        return "WRONG_VERSION_NUMBER" in msg or "SSL" in msg.upper()
+
+    def rewrite(text: str) -> str:
+        try:
+            return _post(state["url"], text)
+        except urllib.error.URLError as exc:
+            # 仅当当前是 https 且像协议错配时，自动回退到 http 重试一次
+            if state["url"].startswith("https://") and _is_ssl_proto_error(exc):
+                http_url = "http://" + state["url"][len("https://"):]
+                result = _post(http_url, text)  # 失败就让它抛出去，交给上层兜底
+                state["url"] = http_url  # 成功了，以后都走 http
+                if not state["fell_back"]:
+                    state["fell_back"] = True
+                    log("WARN", f"https 握手失败（端口疑似 HTTP 明文），已自动改用 {http_url}")
+                return result
+            raise
 
     log("INFO", f"OpenAI 兼容后端已启用：{url}（模型 {model}）。")
     return rewrite
@@ -400,11 +628,17 @@ class Worker(threading.Thread):
         log_file: str | None = None,
         ai_backend: str = "none",
         openai_cfg: dict[str, str] | None = None,
+        include_user: bool = False,
+        max_ai_calls: int = 0,
+        user_ai_only: bool = False,
     ) -> None:
         super().__init__(daemon=True)
         self.roots = roots
         self.patterns = patterns
         self.strip_thinking = strip_thinking
+        self.include_user = include_user
+        self.max_ai_calls = max_ai_calls
+        self.user_ai_only = user_ai_only
         self.in_place = in_place
         self.use_ai = use_ai
         self.ai_backend = ai_backend
@@ -419,9 +653,15 @@ class Worker(threading.Thread):
         self._states: dict[str, WatchState] = {}
         self._pending: dict[str, float] = {}  # 路径 -> 最近一次变化时间
         self._log_fh = None
+        self._scan_request = threading.Event()  # 「全量扫描历史」按钮触发
         # 累计统计
         self.total_files_changed = 0
         self.total_lines_changed = 0
+
+    # --- 外部请求全量扫描 --------------------------------------------- #
+    def request_full_scan(self) -> None:
+        """主线程调用：请求把所有文件现有内容从头扫一遍。"""
+        self._scan_request.set()
 
     # --- 日志 ---------------------------------------------------------- #
     def log(self, level: str, text: str) -> None:
@@ -488,7 +728,10 @@ class Worker(threading.Thread):
             except OSError as exc:
                 self.log_q.put(LogEvent("WARN", f"无法打开落盘日志 {self.log_file}: {exc}"))
         rewriter = self._build_rewriter()
-        cleaner = Cleaner(self.patterns, self.strip_thinking, rewriter, self.log)
+        cleaner = Cleaner(
+            self.patterns, self.strip_thinking, rewriter, self.log,
+            self.include_user, self.max_ai_calls, self.user_ai_only,
+        )
         self._cleaner = cleaner
         self.log("INFO", f"开始监听 {len(self.roots)} 个根；轮询 {self.poll_interval}s。")
         if self.excludes:
@@ -496,6 +739,9 @@ class Worker(threading.Thread):
 
         while not self._stop.is_set():
             try:
+                if self._scan_request.is_set():
+                    self._scan_request.clear()
+                    self.scan_all(cleaner)
                 self._tick(cleaner)
             except Exception as exc:  # 绝不让线程死掉
                 self.log("ERROR", f"主循环异常: {exc}")
@@ -509,6 +755,32 @@ class Worker(threading.Thread):
                 self._log_fh.close()
             except Exception:
                 pass
+
+    # --- 全量扫描历史：无视基线，强制处理所有文件现有内容 ------------- #
+    def scan_all(self, cleaner: Cleaner) -> None:
+        files = self._discover()
+        total = len(files)
+        self.log("INFO", f"=== 全量扫描历史开始：共 {total} 个文件 ===")
+        hit_files = 0
+        for idx, path in enumerate(files, start=1):
+            if self._stop.is_set():
+                self.log("WARN", f"已停止，全量扫描中断于 {idx}/{total}。")
+                return
+            # 每个文件都报一下进度，避免 AI 改写慢时界面看起来像卡死
+            self.log("INFO", f"[扫描] ({idx}/{total}) {self._short(path)}")
+            try:
+                changed = self._process(path, cleaner, full=True)
+                if changed:
+                    hit_files += 1
+            except Exception as exc:
+                self.log("ERROR", f"扫描失败 {self._short(path)}: {exc}")
+            # 处理完更新基线，避免随后又当成新变化重复处理
+            try:
+                st = os.stat(path)
+                self._states[path] = WatchState(st.st_mtime, st.st_size)
+            except OSError:
+                pass
+        self.log("INFO", f"=== 全量扫描历史结束：{hit_files}/{total} 个文件有改动 ===")
 
     def _emit_stats(self, cleaner: Cleaner) -> None:
         self.log(
@@ -548,49 +820,72 @@ class Worker(threading.Thread):
                 self.log("ERROR", f"处理失败 {self._short(path)}: {exc}")
 
     # --- 单文件处理 ---------------------------------------------------- #
-    def _process(self, path: str, cleaner: Cleaner) -> None:
+    def _process(self, path: str, cleaner: Cleaner, full: bool = False) -> bool:
+        """处理单个文件。返回是否有改动。full=True 表示全量扫描（日志措辞不同）。"""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
         except (OSError, UnicodeDecodeError) as exc:
             self.log("WARN", f"读取跳过 {self._short(path)}: {exc}")
-            return
+            return False
 
+        tag = "扫描" if full else "监听"
         out_lines: list[str] = []
         changed_count = 0
+        detail_log: list[str] = []  # 写到该文件旁边的明细
         for idx, line in enumerate(lines, start=1):
             new_line, changed = cleaner.clean_line(line)
             if changed:
                 changed_count += 1
                 if not new_line.endswith("\n"):
                     new_line += "\n"
-                if self.dry_run:
-                    preview = new_line.strip()
-                    if len(preview) > 60:
-                        preview = preview[:60] + "…"
-                    self.log(
-                        "DRY",
-                        f"{self._short(path)} 第{idx}行 -> {preview}",
-                    )
+                # 逐项详细日志（每行可能有多处改动）
+                for d in cleaner.details:
+                    msg = f"{self._short(path)} 第{idx}行 | {d}"
+                    self.log("DRY" if self.dry_run else "EDIT", msg)
+                    detail_log.append(LogEvent("EDIT", msg).render())
             out_lines.append(new_line)
 
         if changed_count == 0:
-            return
+            if full:
+                self.log("INFO", f"[{tag}] 无命中：{self._short(path)}")
+            return False
 
         if self.dry_run:
-            self.log("DRY", f"试运行：{self._short(path)} 共 {changed_count} 处可改（未写文件）")
-            return
+            self.log("DRY", f"[{tag}] 试运行：{self._short(path)} 共 {changed_count} 处可改（未写文件）")
+            self._write_detail_log(path, detail_log, dry=True)
+            return True
 
         self.total_files_changed += 1
         self.total_lines_changed += changed_count
 
         if self.in_place:
             self._write_in_place(path, out_lines)
-            self.log("OK", f"原地修改 {changed_count} 处 -> {self._short(path)}")
+            self.log("OK", f"[{tag}] 原地修改 {changed_count} 处 -> {self._short(path)}")
         else:
             out_path = path[:-6] + ".cleaned.jsonl"  # 去掉 .jsonl
             self._write_atomic(out_path, out_lines)
-            self.log("OK", f"写出副本 {changed_count} 处 -> {self._short(out_path)}")
+            self.log("OK", f"[{tag}] 写出副本 {changed_count} 处 -> {self._short(out_path)}")
+        self._write_detail_log(path, detail_log, dry=False)
+        return True
+
+    def _write_detail_log(self, path: str, lines: list[str], dry: bool) -> None:
+        """把单个 jsonl 的逐项改动明细写到它旁边的 xxx.jsonl.cleanlog。"""
+        if not lines:
+            return
+        log_path = path + ".cleanlog"
+        header = (
+            f"===== {datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S')} "
+            f"{'试运行预览' if dry else '已写入'} 共 {len(lines)} 处 ====="
+        )
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(header + "\n")
+                for ln in lines:
+                    f.write(ln + "\n")
+                f.write("\n")
+        except OSError as exc:
+            self.log("WARN", f"明细日志写入失败 {self._short(log_path)}: {exc}")
 
     def _write_atomic(self, path: str, lines: list[str]) -> None:
         tmp = path + ".tmp"
@@ -634,6 +929,35 @@ class App:
         self._build_scroll_area()
         self._build_ui()
         self._poll_log()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self) -> None:
+        """关窗时把当前界面上的所有选项落盘，下次启动自动带出。"""
+        try:
+            self._persist_options()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    def _persist_options(self) -> None:
+        """把界面上所有可配置项写入 config.json（不校验，原样保存）。"""
+        self.cfg.update(self._collect_backend())
+        try:
+            self.cfg["max_ai_calls"] = max(0, int(float(self.var_maxai.get())))
+        except ValueError:
+            self.cfg["max_ai_calls"] = 0
+        self.cfg["user_ai_only"] = self.var_user_ai_only.get()
+        self.cfg["strip_thinking"] = self.var_strip.get()
+        self.cfg["in_place"] = self.var_inplace.get()
+        self.cfg["dry_run"] = self.var_dry.get()
+        self.cfg["include_user"] = self.var_user.get()
+        self.cfg["log_file_enabled"] = self.var_logfile.get()
+        self.cfg["poll"] = self.var_poll.get()
+        self.cfg["debounce"] = self.var_debounce.get()
+        self.cfg["roots"] = self._read_lines(self.roots_text)
+        self.cfg["patterns"] = self._read_lines(self.pat_text)
+        self.cfg["excludes"] = self._read_lines(self.exc_text)
+        save_config(self.cfg)
 
     # --- 可滚动容器：内容超出窗口也能滚到底 ----------------------------- #
     def _build_scroll_area(self) -> None:
@@ -682,7 +1006,8 @@ class App:
 
         self.roots_text = tk.Text(top, height=5, wrap="none")
         self.roots_text.pack(fill="x", padx=6, pady=6)
-        for r in _default_roots():
+        saved_roots = self.cfg.get("roots")
+        for r in (saved_roots if saved_roots else _default_roots()):
             self.roots_text.insert("end", r + "\n")
 
         btns = ttk.Frame(top)
@@ -696,9 +1021,11 @@ class App:
         opts = ttk.LabelFrame(self.host, text="选项")
         opts.pack(fill="x", **pad)
 
-        self.var_strip = tk.BooleanVar(value=True)
-        self.var_inplace = tk.BooleanVar(value=False)
-        self.var_dry = tk.BooleanVar(value=True)
+        self.var_strip = tk.BooleanVar(value=bool(self.cfg.get("strip_thinking", True)))
+        self.var_inplace = tk.BooleanVar(value=bool(self.cfg.get("in_place", False)))
+        self.var_dry = tk.BooleanVar(value=bool(self.cfg.get("dry_run", True)))
+        self.var_user = tk.BooleanVar(value=bool(self.cfg.get("include_user", True)))
+        self.var_user_ai_only = tk.BooleanVar(value=bool(self.cfg.get("user_ai_only", True)))
 
         ttk.Checkbutton(
             opts, text="去掉思考过程 (thinking/reasoning)", variable=self.var_strip
@@ -713,20 +1040,37 @@ class App:
             text="试运行（仅预览，不写任何文件）",
             variable=self.var_dry,
         ).grid(row=2, column=0, sticky="w", **pad)
-        self.var_logfile = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             opts,
-            text="日志落盘到 cleaner.log",
+            text="一并处理 user 记录（粘贴/回放进来的内容）",
+            variable=self.var_user,
+            command=self._sync_user_ai_only,
+        ).grid(row=3, column=0, sticky="w", **pad)
+        self.chk_user_ai = ttk.Checkbutton(
+            opts,
+            text="↳ 仅改 AI 回放内容（保护你自己输入的话）",
+            variable=self.var_user_ai_only,
+        )
+        self.chk_user_ai.grid(row=4, column=0, sticky="w", padx=24, pady=2)
+        ttk.Label(opts, text="AI改写上限(0=不限)").grid(row=3, column=1, sticky="e")
+        self.var_maxai = tk.StringVar(value=str(self.cfg.get("max_ai_calls", 0)))
+        ttk.Entry(opts, textvariable=self.var_maxai, width=6).grid(
+            row=3, column=2, sticky="w"
+        )
+        self.var_logfile = tk.BooleanVar(value=bool(self.cfg.get("log_file_enabled", True)))
+        ttk.Checkbutton(
+            opts,
+            text="软件日志落盘到程序目录 cleaner.log",
             variable=self.var_logfile,
         ).grid(row=2, column=1, sticky="w", **pad)
 
         ttk.Label(opts, text="轮询(s)").grid(row=1, column=1, sticky="e")
-        self.var_poll = tk.StringVar(value="1.5")
+        self.var_poll = tk.StringVar(value=str(self.cfg.get("poll", "1.5")))
         ttk.Entry(opts, textvariable=self.var_poll, width=6).grid(
             row=1, column=2, sticky="w"
         )
         ttk.Label(opts, text="防抖(s)").grid(row=1, column=3, sticky="e")
-        self.var_debounce = tk.StringVar(value="0.8")
+        self.var_debounce = tk.StringVar(value=str(self.cfg.get("debounce", "0.8")))
         ttk.Entry(opts, textvariable=self.var_debounce, width=6).grid(
             row=1, column=4, sticky="w"
         )
@@ -735,7 +1079,10 @@ class App:
         pat.pack(fill="x", **pad)
         self.pat_text = tk.Text(pat, height=5, wrap="none")
         self.pat_text.pack(fill="x", padx=6, pady=6)
-        self.pat_text.insert("end", "\n".join(DEFAULT_REFUSAL_PATTERNS) + "\n")
+        saved_pats = self.cfg.get("patterns")
+        self.pat_text.insert(
+            "end", "\n".join(saved_pats if saved_pats else DEFAULT_REFUSAL_PATTERNS) + "\n"
+        )
 
         exc = ttk.LabelFrame(
             self.host, text="排除规则（文件名或路径通配，每行一个，如 *.bak、*/archive/*）"
@@ -743,7 +1090,11 @@ class App:
         exc.pack(fill="x", **pad)
         self.exc_text = tk.Text(exc, height=3, wrap="none")
         self.exc_text.pack(fill="x", padx=6, pady=6)
-        self.exc_text.insert("end", "*.cleaned.jsonl\n*.bak\n")
+        saved_exc = self.cfg.get("excludes")
+        self.exc_text.insert(
+            "end",
+            ("\n".join(saved_exc) + "\n") if saved_exc else "*.cleaned.jsonl\n*.bak\n",
+        )
 
         self._build_backend_panel(pad)
 
@@ -759,6 +1110,10 @@ class App:
             ctrl, text="显示统计", command=self._show_stats, state="disabled"
         )
         self.btn_stats.pack(side="left", padx=6)
+        self.btn_scan = ttk.Button(
+            ctrl, text="全量扫描历史", command=self._full_scan, state="disabled"
+        )
+        self.btn_scan.pack(side="left", padx=6)
         self.status = ttk.Label(ctrl, text="未运行")
         self.status.pack(side="left", padx=12)
 
@@ -774,6 +1129,8 @@ class App:
             self._append_log(
                 LogEvent("INFO", "未检测到 anthropic 包：AI 改写不可用，将用正则兜底。")
             )
+
+        self._sync_user_ai_only()  # 按『一并处理 user 记录』当前状态初始化联动勾选框
 
     # --- AI 后端面板 --------------------------------------------------- #
     def _build_backend_panel(self, pad: dict) -> None:
@@ -928,6 +1285,10 @@ class App:
         except ValueError:
             self._append_log(LogEvent("ERROR", "轮询/防抖必须是数字。"))
             return
+        try:
+            max_ai = max(0, int(float(self.var_maxai.get())))
+        except ValueError:
+            max_ai = 0
 
         if self.var_inplace.get():
             self._append_log(
@@ -941,13 +1302,25 @@ class App:
         excludes = self._read_lines(self.exc_text)
         log_file = None
         if self.var_logfile.get():
-            base = roots[0] if os.path.isdir(roots[0]) else os.path.dirname(roots[0])
-            log_file = os.path.join(base or ".", "cleaner.log")
-            self._append_log(LogEvent("INFO", f"日志将落盘到 {log_file}"))
+            # 软件总日志固定写在程序目录，与被监听目录无关
+            log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleaner.log")
+            self._append_log(LogEvent("INFO", f"软件日志将落盘到 {log_file}"))
 
         backend_cfg = self._collect_backend()
         # 每次开始都持久化一份，下次启动自动带出
         self.cfg.update(backend_cfg)
+        self.cfg["max_ai_calls"] = max_ai
+        self.cfg["user_ai_only"] = self.var_user_ai_only.get()
+        self.cfg["strip_thinking"] = self.var_strip.get()
+        self.cfg["in_place"] = self.var_inplace.get()
+        self.cfg["dry_run"] = self.var_dry.get()
+        self.cfg["include_user"] = self.var_user.get()
+        self.cfg["log_file_enabled"] = self.var_logfile.get()
+        self.cfg["poll"] = self.var_poll.get()
+        self.cfg["debounce"] = self.var_debounce.get()
+        self.cfg["roots"] = roots
+        self.cfg["patterns"] = good_patterns
+        self.cfg["excludes"] = excludes
         save_config(self.cfg)
 
         self.worker = Worker(
@@ -969,11 +1342,15 @@ class App:
                 "model": backend_cfg["model"],
                 "prompt": backend_cfg["prompt"],
             },
+            include_user=self.var_user.get(),
+            max_ai_calls=max_ai,
+            user_ai_only=self.var_user_ai_only.get(),
         )
         self.worker.start()
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.btn_stats.config(state="normal")
+        self.btn_scan.config(state="normal")
         self.status.config(text="运行中")
 
     def _stop(self) -> None:
@@ -983,7 +1360,23 @@ class App:
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.btn_stats.config(state="disabled")
+        self.btn_scan.config(state="disabled")
         self.status.config(text="未运行")
+
+    def _sync_user_ai_only(self) -> None:
+        """『仅改 AI 回放内容』勾选框只在『一并处理 user 记录』开启时可用。"""
+        state = "normal" if self.var_user.get() else "disabled"
+        try:
+            self.chk_user_ai.config(state=state)
+        except Exception:
+            pass
+
+    def _full_scan(self) -> None:
+        if not self.worker:
+            self._append_log(LogEvent("WARN", "请先点『开始监听』再全量扫描。"))
+            return
+        self._append_log(LogEvent("INFO", "已请求全量扫描历史，正在后台执行…"))
+        self.worker.request_full_scan()
 
     def _show_stats(self) -> None:
         w = self.worker
@@ -1004,20 +1397,42 @@ class App:
                 self._append_log(LogEvent("STAT", f"  正则命中 {n:>4} 次：{pat}"))
 
     # --- 日志泵 -------------------------------------------------------- #
+    _LOG_MAX_LINES = 2000      # 日志框最多保留多少行，超出从头截断
+    _LOG_DRAIN_PER_TICK = 300  # 每次 tick 最多抽多少条，避免主线程被刷爆卡死
+
     def _append_log(self, ev: LogEvent) -> None:
+        # 单条插入（外部调用，如统计按钮）：复用批量逻辑保证截断一致
+        self._write_log_block(ev.render() + "\n")
+
+    def _write_log_block(self, text: str) -> None:
+        if not text:
+            return
         self.log_text.config(state="normal")
-        self.log_text.insert("end", ev.render() + "\n")
+        self.log_text.insert("end", text)
+        # 截断：只保留最后 _LOG_MAX_LINES 行，防止 Text 无限增长拖垮重绘
+        try:
+            line_count = int(self.log_text.index("end-1c").split(".")[0])
+            if line_count > self._LOG_MAX_LINES:
+                self.log_text.delete("1.0", f"{line_count - self._LOG_MAX_LINES}.0")
+        except Exception:
+            pass
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
     def _poll_log(self) -> None:
+        # 限量抽取：一次最多 _LOG_DRAIN_PER_TICK 条，拼成一块只插入一次、只滚动一次
+        chunk: list[str] = []
         try:
-            while True:
+            for _ in range(self._LOG_DRAIN_PER_TICK):
                 ev = self.log_q.get_nowait()
-                self._append_log(ev)
+                chunk.append(ev.render())
         except queue.Empty:
             pass
-        self.root.after(200, self._poll_log)
+        if chunk:
+            self._write_log_block("\n".join(chunk) + "\n")
+        # 队列还堆着就尽快回来继续抽，否则正常 200ms 轮询
+        backlog = not self.log_q.empty()
+        self.root.after(30 if backlog else 200, self._poll_log)
 
 
 def main() -> int:
