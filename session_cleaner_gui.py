@@ -772,6 +772,8 @@ class Worker(threading.Thread):
                 changed = self._process(path, cleaner, full=True)
                 if changed:
                     hit_files += 1
+            except PermissionError as exc:
+                self.log("WARN", f"文件被占用，扫描跳过: {self._short(path)}: {exc}")
             except Exception as exc:
                 self.log("ERROR", f"扫描失败 {self._short(path)}: {exc}")
             # 处理完更新基线，避免随后又当成新变化重复处理
@@ -816,6 +818,9 @@ class Worker(threading.Thread):
             self._pending.pop(path, None)
             try:
                 self._process(path, cleaner)
+            except PermissionError as exc:
+                # 文件被其他进程占用（常见于 Codex 活跃会话），下次变化时自动重试
+                self.log("WARN", f"文件被占用，写入跳过（下次变化时重试）: {self._short(path)}: {exc}")
             except Exception as exc:
                 self.log("ERROR", f"处理失败 {self._short(path)}: {exc}")
 
@@ -891,7 +896,22 @@ class Worker(threading.Thread):
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.writelines(lines)
-        os.replace(tmp, path)
+        # Windows 上目标文件若被其他进程占用，os.replace 会抛 PermissionError。
+        # 最多重试 3 次（间隔 0.4s），对活跃会话文件给它机会释放锁。
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError as exc:
+                last_exc = exc
+                time.sleep(0.4)
+        # 全部重试失败：清理 .tmp，向上抛原始异常
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise last_exc  # type: ignore[misc]
 
     def _write_in_place(self, path: str, lines: list[str]) -> None:
         bak = path + ".bak"
