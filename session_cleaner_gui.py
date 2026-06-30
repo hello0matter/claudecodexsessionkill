@@ -897,21 +897,22 @@ class Worker(threading.Thread):
         with open(tmp, "w", encoding="utf-8") as f:
             f.writelines(lines)
         # Windows 上目标文件若被其他进程占用，os.replace 会抛 PermissionError。
-        # 最多重试 3 次（间隔 0.4s），对活跃会话文件给它机会释放锁。
-        last_exc: Exception | None = None
+        # 重试 3 次后退回直接覆写（Codex 以 append 模式持有文件时通常允许并发写）。
         for attempt in range(3):
             try:
                 os.replace(tmp, path)
                 return
-            except PermissionError as exc:
-                last_exc = exc
+            except PermissionError:
                 time.sleep(0.4)
-        # 全部重试失败：清理 .tmp，向上抛原始异常
+        # 原子改名失败：直接覆写原文件，清理 .tmp
         try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise last_exc  # type: ignore[misc]
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     def _write_in_place(self, path: str, lines: list[str]) -> None:
         bak = path + ".bak"
