@@ -24,11 +24,14 @@ thinking / reasoning 思考过程块。
 from __future__ import annotations
 
 import fnmatch
+import functools
+import http.client
 import json
 import os
 import queue
 import re
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -134,9 +137,153 @@ DEFAULT_REWRITE_PROMPT = (
 DEFAULT_OPENAI_BASE = "https://www.1314mc.net:3333/v1"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
+# 仅控制本程序发出的 AI 请求，不修改系统、Claude 或 Codex 的代理设置。
+NETWORK_MODES = {
+    "direct": "直连",
+    "http": "HTTP 代理",
+    "socks5h": "SOCKS5（远程 DNS）",
+}
+DEFAULT_PROXY_HOST = "127.0.0.1"
+DEFAULT_PROXY_PORT = 7891
+
 # 被视为"思考过程"的内容块类型 / 字段名，发现即移除。
 THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking", "reasoning"}
 THINKING_KEYS = {"thinking", "reasoning", "reasoning_content", "thinking_blocks"}
+
+
+# --------------------------------------------------------------------------- #
+# 应用级网络传输
+# --------------------------------------------------------------------------- #
+def normalize_network_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = config or {}
+    mode = str(config.get("network_mode", "direct"))
+    if mode not in NETWORK_MODES:
+        mode = "direct"
+    host = str(config.get("proxy_host", DEFAULT_PROXY_HOST)).strip()
+    if not host:
+        if mode == "direct":
+            host = DEFAULT_PROXY_HOST
+        else:
+            raise ValueError("代理地址不能为空")
+    try:
+        raw_port = str(config.get("proxy_port", DEFAULT_PROXY_PORT)).strip()
+        port = int(raw_port or DEFAULT_PROXY_PORT)
+    except ValueError as exc:
+        if mode == "direct":
+            port = DEFAULT_PROXY_PORT
+        else:
+            raise ValueError("代理端口必须是数字") from exc
+    if mode == "direct" and not 1 <= port <= 65535:
+        port = DEFAULT_PROXY_PORT
+    elif not 1 <= port <= 65535:
+        raise ValueError("代理端口必须在 1 到 65535 之间")
+    return {"network_mode": mode, "proxy_host": host, "proxy_port": port}
+
+
+def network_config_display(config: dict[str, Any] | None = None) -> str:
+    config = normalize_network_config(config)
+    mode = config["network_mode"]
+    if mode == "direct":
+        return NETWORK_MODES[mode]
+    return (
+        f"{NETWORK_MODES[mode]} "
+        f"{config['proxy_host']}:{config['proxy_port']}"
+    )
+
+
+def _socks_connection_factory(config: dict[str, Any]):
+    try:
+        import socks
+    except ImportError as exc:
+        raise RuntimeError(
+            "SOCKS5 模式需要 PySocks，请运行 python -m pip install PySocks"
+        ) from exc
+    return functools.partial(
+        socks.create_connection,
+        proxy_type=socks.SOCKS5,
+        proxy_addr=config["proxy_host"],
+        proxy_port=config["proxy_port"],
+        proxy_rdns=True,
+    )
+
+
+class _SocksHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, proxy_config=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _socks_connection_factory(proxy_config)
+
+
+class _SocksHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, proxy_config=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _socks_connection_factory(proxy_config)
+
+
+class _SocksProxyHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
+    def __init__(self, config: dict[str, Any]):
+        super().__init__()
+        self.config = config
+
+    def http_open(self, request):
+        connection = functools.partial(
+            _SocksHTTPConnection, proxy_config=self.config
+        )
+        return self.do_open(connection, request)
+
+    def https_open(self, request):
+        connection = functools.partial(
+            _SocksHTTPSConnection, proxy_config=self.config
+        )
+        return self.do_open(connection, request)
+
+
+def build_url_opener(config: dict[str, Any] | None = None):
+    """创建只供本程序 AI 请求使用的 opener。直连时忽略系统代理。"""
+    config = normalize_network_config(config)
+    mode = config["network_mode"]
+    if mode == "http":
+        proxy_url = f"http://{config['proxy_host']}:{config['proxy_port']}"
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+    if mode == "socks5h":
+        return urllib.request.build_opener(_SocksProxyHandler(config))
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def describe_network_error(exc: Exception, config: dict[str, Any] | None = None) -> str:
+    config = normalize_network_config(config)
+    text = str(getattr(exc, "reason", exc))
+    lowered = text.lower()
+    if "10061" in text or "connection refused" in lowered:
+        if config["network_mode"] != "direct":
+            return (
+                f"无法连接代理 {config['proxy_host']}:{config['proxy_port']}"
+                "（WinError 10061）。请启动 Clash/代理程序，或改为直连。"
+            )
+    if "11001" in text or "11002" in text or "getaddrinfo failed" in lowered:
+        if config["network_mode"] == "direct":
+            return "本机 DNS 无法解析目标域名，可改用 SOCKS5（远程 DNS）。"
+    return text
+
+
+def build_anthropic_http_client(config: dict[str, Any] | None = None):
+    config = normalize_network_config(config)
+    kwargs: dict[str, Any] = {"trust_env": False}
+    mode = config["network_mode"]
+    if mode == "http":
+        kwargs["proxy"] = f"http://{config['proxy_host']}:{config['proxy_port']}"
+    elif mode == "socks5h":
+        kwargs["proxy"] = f"socks5://{config['proxy_host']}:{config['proxy_port']}"
+    try:
+        return anthropic.DefaultHttpxClient(**kwargs)
+    except ImportError as exc:
+        if mode == "socks5h":
+            raise RuntimeError(
+                "Anthropic 的 SOCKS5 模式需要 socksio，请运行 "
+                "python -m pip install 'httpx[socks]'"
+            ) from exc
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -478,7 +625,8 @@ class Cleaner:
         return json.dumps(obj, ensure_ascii=False), True
 # --------------------------------------------------------------------------- #
 def make_ai_rewriter(
-    log: Callable[[str, str], None]
+    log: Callable[[str, str], None],
+    network_config: dict[str, Any] | None = None,
 ) -> Callable[[str], str] | None:
     """有 anthropic 包 + API key 才返回可用的改写函数，否则 None。"""
     if not _HAS_ANTHROPIC:
@@ -488,7 +636,10 @@ def make_ai_rewriter(
         log("INFO", "未设置 ANTHROPIC_API_KEY，使用纯正则替换。")
         return None
 
-    client = anthropic.Anthropic()
+    network_config = normalize_network_config(network_config)
+    client = anthropic.Anthropic(
+        http_client=build_anthropic_http_client(network_config)
+    )
     model = os.environ.get("CLEANER_MODEL", "claude-opus-4-8")
     system = (
         "你是文本改写器。收到的是某个 AI 助手生成的、带有拒绝或道德化措辞的回复。"
@@ -506,7 +657,11 @@ def make_ai_rewriter(
         parts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
         return "".join(parts).strip()
 
-    log("INFO", f"AI 改写已启用，模型 ={model}。")
+    log(
+        "INFO",
+        f"AI 改写已启用，模型 ={model}，网络："
+        f"{network_config_display(network_config)}。",
+    )
     return rewrite
 
 
@@ -519,6 +674,7 @@ def make_openai_rewriter(
     model: str,
     prompt: str,
     log: Callable[[str, str], None],
+    network_config: dict[str, Any] | None = None,
 ) -> Callable[[str], str] | None:
     """走 /v1/chat/completions。base_url 形如 https://host:port/v1 。"""
     if not base_url or not api_key:
@@ -529,6 +685,8 @@ def make_openai_rewriter(
     if not url.endswith("/chat/completions"):
         url = url + "/chat/completions"
     system = prompt or DEFAULT_REWRITE_PROMPT
+    network_config = normalize_network_config(network_config)
+    opener = build_url_opener(network_config)
     # 实际使用的 url（可能因 https 协议错误自动回退到 http）
     state = {"url": url, "fell_back": False}
 
@@ -553,7 +711,7 @@ def make_openai_rewriter(
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=18) as resp:
+        with opener.open(req, timeout=18) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"].strip()
 
@@ -577,7 +735,11 @@ def make_openai_rewriter(
                 return result
             raise
 
-    log("INFO", f"OpenAI 兼容后端已启用：{url}（模型 {model}）。")
+    log(
+        "INFO",
+        f"OpenAI 兼容后端已启用：{url}（模型 {model}，网络："
+        f"{network_config_display(network_config)}）。",
+    )
     return rewrite
 
 
@@ -628,6 +790,7 @@ class Worker(threading.Thread):
         log_file: str | None = None,
         ai_backend: str = "none",
         openai_cfg: dict[str, str] | None = None,
+        network_cfg: dict[str, Any] | None = None,
         include_user: bool = False,
         max_ai_calls: int = 0,
         user_ai_only: bool = False,
@@ -643,6 +806,7 @@ class Worker(threading.Thread):
         self.use_ai = use_ai
         self.ai_backend = ai_backend
         self.openai_cfg = openai_cfg or {}
+        self.network_cfg = normalize_network_config(network_cfg)
         self.dry_run = dry_run
         self.excludes = excludes or []
         self.log_file = log_file
@@ -698,9 +862,10 @@ class Worker(threading.Thread):
                 cfg.get("model", DEFAULT_OPENAI_MODEL),
                 cfg.get("prompt", DEFAULT_REWRITE_PROMPT),
                 self.log,
+                self.network_cfg,
             )
         if backend == "anthropic":
-            return make_ai_rewriter(self.log)
+            return make_ai_rewriter(self.log, self.network_cfg)
         self.log("INFO", "未启用 AI 后端，使用纯正则兜底替换。")
         return None
 
@@ -1195,22 +1360,127 @@ class App:
         self.btn_test = ttk.Button(grid, text="测试连接", command=self._test_backend)
         self.btn_test.grid(row=1, column=2, sticky="e", padx=4, pady=2)
 
+        network = ttk.Frame(bk)
+        network.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(network, text="网络：").pack(side="left")
+        mode = str(cfg.get("network_mode", "direct"))
+        if mode not in NETWORK_MODES:
+            mode = "direct"
+        self.var_network_mode = tk.StringVar(value=NETWORK_MODES[mode])
+        self.network_mode_combo = ttk.Combobox(
+            network,
+            textvariable=self.var_network_mode,
+            values=tuple(NETWORK_MODES.values()),
+            state="readonly",
+            width=20,
+        )
+        self.network_mode_combo.pack(side="left", padx=(4, 10))
+        self.network_mode_combo.bind("<<ComboboxSelected>>", self._sync_proxy_controls)
+        ttk.Label(network, text="代理地址").pack(side="left")
+        self.var_proxy_host = tk.StringVar(
+            value=str(cfg.get("proxy_host", DEFAULT_PROXY_HOST))
+        )
+        self.proxy_host_entry = ttk.Entry(
+            network, textvariable=self.var_proxy_host, width=18
+        )
+        self.proxy_host_entry.pack(side="left", padx=4)
+        ttk.Label(network, text="端口").pack(side="left")
+        self.var_proxy_port = tk.StringVar(
+            value=str(cfg.get("proxy_port", DEFAULT_PROXY_PORT))
+        )
+        self.proxy_port_entry = ttk.Entry(
+            network, textvariable=self.var_proxy_port, width=7
+        )
+        self.proxy_port_entry.pack(side="left", padx=4)
+        self.btn_test_proxy = ttk.Button(
+            network, text="测试代理端口", command=self._test_proxy_port
+        )
+        self.btn_test_proxy.pack(side="left", padx=(8, 0))
+        ttk.Label(
+            bk,
+            text=(
+                "代理仅用于本软件的远程 AI 请求；SOCKS5 使用远程 DNS。"
+                "不会修改系统、Claude 或 Codex 的代理。"
+            ),
+            foreground="#666666",
+        ).pack(anchor="w", padx=6, pady=(0, 2))
+
         ttk.Label(bk, text="改写 Prompt（system）").pack(anchor="w", padx=6, pady=(4, 0))
         self.prompt_text = tk.Text(bk, height=3, wrap="word")
         self.prompt_text.pack(fill="x", padx=6, pady=(0, 6))
         self.prompt_text.insert("end", cfg.get("prompt", DEFAULT_REWRITE_PROMPT))
+        self._sync_proxy_controls()
 
-    def _collect_backend(self) -> dict[str, str]:
+    def _sync_proxy_controls(self, _event=None) -> None:
+        enabled = self.var_network_mode.get() != NETWORK_MODES["direct"]
+        entry_state = "normal" if enabled else "disabled"
+        button_state = "normal" if enabled else "disabled"
+        self.proxy_host_entry.configure(state=entry_state)
+        self.proxy_port_entry.configure(state=entry_state)
+        self.btn_test_proxy.configure(state=button_state)
+
+    def _test_proxy_port(self) -> None:
+        try:
+            config = self._collect_network()
+        except ValueError as exc:
+            self._append_log(LogEvent("ERROR", f"代理配置无效：{exc}"))
+            return
+        if config["network_mode"] == "direct":
+            self._append_log(LogEvent("INFO", "当前为直连模式，无需测试代理端口。"))
+            return
+
+        self.btn_test_proxy.configure(state="disabled")
+        self._append_log(
+            LogEvent(
+                "INFO",
+                f"正在测试代理 {config['proxy_host']}:{config['proxy_port']}…",
+            )
+        )
+
+        def worker() -> None:
+            try:
+                with socket.create_connection(
+                    (config["proxy_host"], config["proxy_port"]), timeout=3
+                ):
+                    pass
+                self.log_q.put(LogEvent("OK", "代理端口可以连接，请继续测试 AI 后端。"))
+            except OSError as exc:
+                self.log_q.put(
+                    LogEvent("ERROR", f"代理端口不可用：{describe_network_error(exc, config)}")
+                )
+            finally:
+                self.root.after(0, self._sync_proxy_controls)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _collect_network(self) -> dict[str, Any]:
+        reverse_modes = {label: mode for mode, label in NETWORK_MODES.items()}
+        return normalize_network_config(
+            {
+                "network_mode": reverse_modes.get(
+                    self.var_network_mode.get(), "direct"
+                ),
+                "proxy_host": self.var_proxy_host.get(),
+                "proxy_port": self.var_proxy_port.get(),
+            }
+        )
+
+    def _collect_backend(self) -> dict[str, Any]:
         return {
             "backend": self.var_backend.get(),
             "base_url": self.var_base.get().strip(),
             "model": self.var_model.get().strip() or DEFAULT_OPENAI_MODEL,
             "api_key": self.var_key.get().strip(),
             "prompt": self.prompt_text.get("1.0", "end").strip() or DEFAULT_REWRITE_PROMPT,
+            **self._collect_network(),
         }
 
     def _save_backend(self) -> None:
-        self.cfg.update(self._collect_backend())
+        try:
+            self.cfg.update(self._collect_backend())
+        except ValueError as exc:
+            self._append_log(LogEvent("ERROR", f"配置未保存：{exc}"))
+            return
         save_config(self.cfg)
         self._append_log(LogEvent("INFO", f"配置已保存到 {CONFIG_PATH}"))
 
@@ -1233,10 +1503,11 @@ class App:
             try:
                 if backend == "openai":
                     rw = make_openai_rewriter(
-                        cfg["base_url"], cfg["api_key"], cfg["model"], cfg["prompt"], log
+                        cfg["base_url"], cfg["api_key"], cfg["model"], cfg["prompt"],
+                        log, cfg,
                     )
                 else:  # anthropic
-                    rw = make_ai_rewriter(log)
+                    rw = make_ai_rewriter(log, cfg)
                 if rw is None:
                     self.log_q.put(LogEvent("ERROR", "测试失败：后端未就绪（缺 Key/包/环境变量）。"))
                     return
@@ -1252,9 +1523,13 @@ class App:
                     LogEvent("ERROR", f"测试失败 HTTP {exc.code} {exc.reason}：{detail}")
                 )
             except urllib.error.URLError as exc:
-                self.log_q.put(LogEvent("ERROR", f"测试失败，连不上：{exc.reason}"))
+                self.log_q.put(
+                    LogEvent("ERROR", f"测试失败，连不上：{describe_network_error(exc, cfg)}")
+                )
             except Exception as exc:
-                self.log_q.put(LogEvent("ERROR", f"测试失败：{exc}"))
+                self.log_q.put(
+                    LogEvent("ERROR", f"测试失败：{describe_network_error(exc, cfg)}")
+                )
             finally:
                 self.root.after(0, lambda: self.btn_test.config(state="normal"))
 
@@ -1327,7 +1602,11 @@ class App:
             log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleaner.log")
             self._append_log(LogEvent("INFO", f"软件日志将落盘到 {log_file}"))
 
-        backend_cfg = self._collect_backend()
+        try:
+            backend_cfg = self._collect_backend()
+        except ValueError as exc:
+            self._append_log(LogEvent("ERROR", f"网络配置无效：{exc}"))
+            return
         # 每次开始都持久化一份，下次启动自动带出
         self.cfg.update(backend_cfg)
         self.cfg["max_ai_calls"] = max_ai
@@ -1363,6 +1642,7 @@ class App:
                 "model": backend_cfg["model"],
                 "prompt": backend_cfg["prompt"],
             },
+            network_cfg=backend_cfg,
             include_user=self.var_user.get(),
             max_ai_calls=max_ai,
             user_ai_only=self.var_user_ai_only.get(),

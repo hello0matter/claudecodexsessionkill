@@ -1,2 +1,5 @@
 # 可选依赖：装了才会启用 AI 改写，不装也能用（退回纯正则替换）。
 anthropic>=0.40.0
+# 应用内 SOCKS5（远程 DNS）代理。httpx extra 供 Anthropic 后端使用。
+PySocks>=1.7.1
+httpx[socks]>=0.27.0

@@ -51,6 +51,11 @@ python session_cleaner_gui.py
 面板里的 **改写 Prompt（system）** 可自由编辑；点 **「保存配置」** 或每次「开始监听」时，
 后端选择 / Base URL / Key / 模型 / Prompt 都会写入同目录的 `config.json`，下次启动自动带出。
 
+网络可选 **直连 / HTTP 代理 / SOCKS5（远程 DNS）**，默认代理地址为
+`127.0.0.1:7891`。该设置只作用于本软件发出的 OpenAI 兼容或 Anthropic 请求，
+不会修改 Windows 系统代理、环境变量以及 Claude/Codex 的启动配置。使用 SOCKS5 前请先
+运行 `pip install -r requirements.txt`。
+
 > ⚠️ `config.json` 会**明文保存 API Key**。仓库已用 `.gitignore` 排除它，请勿手动提交或外发。
 
 ```bash
