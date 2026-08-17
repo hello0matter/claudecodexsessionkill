@@ -136,6 +136,8 @@ DEFAULT_REWRITE_PROMPT = (
 # OpenAI 兼容后端默认值。
 DEFAULT_OPENAI_BASE = "https://www.1314mc.net:3333/v1"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_USER_AGENT = "OpenAI/Python 2.0.0"
+OPENAI_MAX_NETWORK_ATTEMPTS = 3
 
 # 仅控制本程序发出的 AI 请求，不修改系统、Claude 或 Codex 的代理设置。
 NETWORK_MODES = {
@@ -706,14 +708,33 @@ def make_openai_rewriter(
             target,
             data=body,
             headers={
+                "Accept": "application/json",
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
+                # 部分 Cloudflare 规则会直接封禁 Python-urllib/3.x（1010）。
+                # 使用官方 OpenAI Python SDK 的客户端标识，和该兼容接口匹配。
+                "User-Agent": OPENAI_USER_AGENT,
             },
             method="POST",
         )
-        with opener.open(req, timeout=18) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"].strip()
+        for attempt in range(1, OPENAI_MAX_NETWORK_ATTEMPTS + 1):
+            try:
+                with opener.open(req, timeout=18) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                return data["choices"][0]["message"]["content"].strip()
+            except urllib.error.HTTPError:
+                # 服务端已经明确响应，交给调用方展示，不盲目重试。
+                raise
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+                if attempt >= OPENAI_MAX_NETWORK_ATTEMPTS:
+                    raise
+                log(
+                    "WARN",
+                    f"代理/网络连接中断（{exc}），正在重试 "
+                    f"{attempt}/{OPENAI_MAX_NETWORK_ATTEMPTS - 1}…",
+                )
+                time.sleep(0.4 * attempt)
+        raise RuntimeError("AI 请求重试流程异常结束")
 
     def _is_ssl_proto_error(exc: Exception) -> bool:
         # https 打到了 http 明文端口时，urllib 抛 URLError(SSLError: WRONG_VERSION_NUMBER)

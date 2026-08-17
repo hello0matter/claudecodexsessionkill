@@ -1,4 +1,5 @@
 import unittest
+import urllib.error
 import urllib.request
 from unittest import mock
 
@@ -87,6 +88,37 @@ class NetworkTests(unittest.TestCase):
             trust_env=False,
             proxy="socks5://127.0.0.1:7891",
         )
+
+    def test_openai_rewriter_uses_sdk_user_agent_and_retries_proxy_drop(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = (
+            b'{"choices":[{"message":{"content":"ok"}}]}'
+        )
+        opener = mock.MagicMock()
+        opener.open.side_effect = [
+            urllib.error.URLError(FileNotFoundError(2, "No such file or directory")),
+            response,
+        ]
+        logs = []
+        with (
+            mock.patch.object(app, "build_url_opener", return_value=opener),
+            mock.patch.object(app.time, "sleep"),
+        ):
+            rewrite = app.make_openai_rewriter(
+                "https://example.com/v1",
+                "test-key",
+                "test-model",
+                "test-prompt",
+                lambda level, text: logs.append((level, text)),
+                {"network_mode": "http", "proxy_host": "127.0.0.1", "proxy_port": 7891},
+            )
+            result = rewrite("test")
+
+        request = opener.open.call_args_list[0].args[0]
+        self.assertEqual(result, "ok")
+        self.assertEqual(request.get_header("User-agent"), app.OPENAI_USER_AGENT)
+        self.assertEqual(opener.open.call_count, 2)
+        self.assertTrue(any(level == "WARN" for level, _text in logs))
 
 
 if __name__ == "__main__":
