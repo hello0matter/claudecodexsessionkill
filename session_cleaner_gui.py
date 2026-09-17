@@ -795,14 +795,19 @@ def make_openai_rewriter(
 # --------------------------------------------------------------------------- #
 # 配置读写（保存 AI 后端设置；注意 key 会明文存在 config.json）
 # --------------------------------------------------------------------------- #
+def resolve_api_key(cfg: dict[str, Any] | None = None) -> str:
+    env = os.environ.get("OPENAI_API_KEY", "").strip()
+    if env:
+        return env
+    return str((cfg or {}).get("api_key") or "").strip()
+
+
 def load_config() -> dict[str, Any]:
     for path in (CONFIG_PATH, LEGACY_CONFIG_PATH):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             if isinstance(cfg, dict):
-                # Keys from old versions are intentionally not loaded.
-                cfg.pop("api_key", None)
                 return cfg
         except (OSError, json.JSONDecodeError):
             continue
@@ -813,9 +818,6 @@ def save_config(cfg: dict[str, Any]) -> None:
     try:
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         data = dict(cfg)
-        # API keys belong in the environment or an OS credential manager, never
-        # in a config file that may be copied or backed up.
-        data.pop("api_key", None)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         if os.name != "nt":
@@ -1414,7 +1416,7 @@ class App:
             row=0, column=3, sticky="w", padx=4, pady=2
         )
         ttk.Label(grid, text="API Key").grid(row=1, column=0, sticky="e", padx=4, pady=2)
-        self.var_key = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
+        self.var_key = tk.StringVar(value=resolve_api_key(cfg))
         ttk.Entry(grid, textvariable=self.var_key, width=46, show="*").grid(
             row=1, column=1, sticky="w", padx=4, pady=2
         )
@@ -1425,7 +1427,7 @@ class App:
         self.btn_test.grid(row=1, column=2, sticky="e", padx=4, pady=2)
         ttk.Label(
             bk,
-            text="API Key 仅在本次运行中使用；可通过 OPENAI_API_KEY 环境变量设置。",
+            text="API Key 会写入用户配置目录。环境变量 OPENAI_API_KEY 优先于已保存的 Key。",
             foreground="#666666",
         ).pack(anchor="w", padx=6, pady=(0, 2))
 
@@ -1552,7 +1554,7 @@ class App:
             return
         save_config(self.cfg)
         self._append_log(
-            LogEvent("INFO", f"配置已保存到 {CONFIG_PATH}（API Key 未写入）")
+            LogEvent("INFO", f"配置已保存到 {CONFIG_PATH}")
         )
 
     def _test_backend(self) -> None:
@@ -1878,7 +1880,7 @@ def _build_cli_worker(args: argparse.Namespace) -> Worker:
     }
     openai_cfg = {
         "base_url": args.base_url or cfg.get("base_url", DEFAULT_OPENAI_BASE),
-        "api_key": os.environ.get("OPENAI_API_KEY", ""),
+        "api_key": resolve_api_key(cfg),
         "model": args.model or cfg.get("model", DEFAULT_OPENAI_MODEL),
         "prompt": cfg.get("prompt", DEFAULT_REWRITE_PROMPT),
     }

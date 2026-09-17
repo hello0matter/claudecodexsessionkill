@@ -82,15 +82,8 @@ SSH 或没有 `$DISPLAY`/Wayland 的环境请直接使用 `scan`/`watch`，无�
 - **Anthropic**：需 `pip install -r requirements.txt` 且设置 `ANTHROPIC_API_KEY` 环境变量（模型默认 `claude-opus-4-8`，可用 `CLEANER_MODEL` 改）。
 
 面板里的 **改写 Prompt（system）** 可自由编辑；点 **「保存配置」** 或每次「开始监听」时，
-后端选择 / Base URL / 模型 / Prompt 会写入用户配置目录。API Key 不落盘，仅从界面当前运行或环境变量读取：
-
-```powershell
-$env:OPENAI_API_KEY="sk-..." # Windows PowerShell
-```
-
-```bash
-export OPENAI_API_KEY='sk-...' # Linux/Kali
-```
+后端选择 / Base URL / API Key / 模型 / Prompt 都会写入用户配置目录，下次启动自动带出。
+若设置了环境变量 `OPENAI_API_KEY`，它会覆盖已保存的 Key。
 
 配置目录为 Windows `%APPDATA%\claude-codex-session-cleaner`，Linux
 `${XDG_CONFIG_HOME:-~/.config}/claude-codex-session-cleaner`。
@@ -100,7 +93,7 @@ export OPENAI_API_KEY='sk-...' # Linux/Kali
 不会修改 Windows 系统代理、环境变量以及 Claude/Codex 的启动配置。使用 SOCKS5 前请先
 运行 `pip install -r requirements.txt`。
 
-旧版本程序目录中的 `config.json` 可以继续迁移普通设置，其中的 API Key 会被忽略。
+旧版本程序目录中的 `config.json` 会继续迁移，包括其中的 API Key。
 
 ```bash
 # 零依赖即可运行（只用标准库 tkinter；OpenAI 后端也只用 urllib）

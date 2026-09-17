@@ -3,22 +3,30 @@ import os
 import queue
 import tempfile
 import unittest
-from argparse import Namespace
 from unittest import mock
 
 import session_cleaner_gui as app
 
 
 class CrossPlatformTests(unittest.TestCase):
-    def test_config_does_not_persist_api_key(self):
+    def test_config_persists_api_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
             with mock.patch.object(app, "CONFIG_PATH", path):
                 app.save_config({"backend": "openai", "api_key": "secret"})
                 with open(path, encoding="utf-8") as config_file:
                     saved = json.load(config_file)
+                loaded = app.load_config()
 
-        self.assertEqual(saved, {"backend": "openai"})
+        self.assertEqual(saved, {"backend": "openai", "api_key": "secret"})
+        self.assertEqual(loaded["api_key"], "secret")
+
+    def test_resolve_api_key_prefers_environment(self):
+        cfg = {"api_key": "saved-key"}
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "env-key"}):
+            self.assertEqual(app.resolve_api_key(cfg), "env-key")
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
+            self.assertEqual(app.resolve_api_key(cfg), "saved-key")
 
     def test_cli_scan_writes_cleaned_copy(self):
         record = {
