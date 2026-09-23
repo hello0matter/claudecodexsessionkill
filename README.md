@@ -81,8 +81,11 @@ SSH 或没有 `$DISPLAY`/Wayland 的环境请直接使用 `scan`/`watch`，无�
 - **OpenAI 兼容**：填 Base URL / API Key / 模型，走标准 `/v1/chat/completions`，**只用标准库 `urllib`，不需要装任何包**。默认 Base URL 为 `https://api.1314mc.net/v1`，默认模型为 `gpt-5.5`。
 - **Anthropic**：需 `pip install -r requirements.txt` 且设置 `ANTHROPIC_API_KEY` 环境变量（模型默认 `claude-opus-4-8`，可用 `CLEANER_MODEL` 改）。
 
-面板里的 **改写 Prompt（system）** 可自由编辑；点 **「保存配置」** 或每次「开始监听」时，
-后端选择 / Base URL / API Key / 模型 / Prompt 都会写入用户配置目录，下次启动自动带出。
+面板里的 **改写 Prompt（system）** 只在真正调用 AI 时使用。
+**兜底替换文本** 是另一项，默认是「好的，我继续执行之前的步骤。」，只有没接上 AI 时才会用这句，也可以在面板里改。
+点 **「保存配置」** 或每次「开始监听」时，后端、Base URL、API Key、模型、Prompt 和兜底句都会写入用户配置目录。
+监听已经开始后，改后端或补上 Key 也会自动生效，不必先停掉。
+已经写成兜底句的旧内容，接上 AI 后点 **「全量扫描历史」** 会再送给模型。
 若设置了环境变量 `OPENAI_API_KEY`，它会覆盖已保存的 Key。
 
 配置目录为 Windows `%APPDATA%\claude-codex-session-cleaner`，Linux

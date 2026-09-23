@@ -345,11 +345,14 @@ class Cleaner:
         include_user: bool = False,
         max_ai_calls: int = 0,
         user_ai_only: bool = False,
+        fallback_text: str = "",
     ) -> None:
         self.regexes = [(p, re.compile(p, re.IGNORECASE)) for p in patterns]
         self.strip_thinking = strip_thinking
         self.rewriter = rewriter
+        self.fallback_text = (fallback_text or FALLBACK_REPLACEMENT).strip() or FALLBACK_REPLACEMENT
         self.log = log
+        self._no_ai_warned = False
         self.include_user = include_user  # 是否也处理 user 记录（粘贴/回放内容）
         self.user_ai_only = user_ai_only  # user 记录仅处理被判定为 AI 回放的
         # 统计：正则命中次数、被删思考块/字段数。
@@ -414,10 +417,10 @@ class Cleaner:
 
     def _rewrite_text(self, text: str, where: str = "") -> tuple[str, bool]:
         """返回 (新文本, 是否改动)。where 标注是正文还是思考块，用于明细日志。"""
-        if not text or not self._matches_refusal(text):
+        canned = text.strip() == self.fallback_text
+        if not text or (not self._matches_refusal(text) and not (canned and self.rewriter)):
             return text, False
-        # 已经是兜底文本，别重复改
-        if text.strip() == FALLBACK_REPLACEMENT:
+        if canned and self.rewriter is None:
             return text, False
 
         # 长文本（多句）只替换命中拒绝词的句子，保留其余内容，避免把一大段
@@ -436,9 +439,12 @@ class Cleaner:
 
     def _rewrite_one(self, seg: str) -> str | None:
         """改写单个命中片段，返回新文本；AI 失败/超限/无改写器则用兜底。None 表示未命中。"""
-        if not seg.strip() or not any(rx.search(seg) for _p, rx in self.regexes):
+        stripped = seg.strip()
+        canned = stripped == self.fallback_text
+        matched = any(rx.search(seg) for _p, rx in self.regexes)
+        if not stripped or (not matched and not (canned and self.rewriter)):
             return None
-        if seg.strip() == FALLBACK_REPLACEMENT:
+        if canned and self.rewriter is None:
             return None
         key = seg.strip()
         # 缓存命中：相同片段不再调 AI
@@ -457,13 +463,30 @@ class Cleaner:
                 try:
                     self.ai_calls += 1
                     new = self.rewriter(seg)
-                    if new and new.strip():
+                    if new and new.strip() and new.strip() != key:
                         self.rewrite_cache[key] = new
                         return new
+                    if new and new.strip() == key:
+                        self.rewrite_cache[key] = new
+                        return None
                 except Exception as exc:
                     self.log("WARN", f"AI 改写失败，使用兜底文本: {exc}")
-        self.rewrite_cache[key] = FALLBACK_REPLACEMENT
-        return FALLBACK_REPLACEMENT
+        if self.rewriter is None and not self._no_ai_warned:
+            self._no_ai_warned = True
+            self.log(
+                "WARN",
+                "没有可用的 AI 改写器，命中内容先换成兜底句。"
+                "选 OpenAI 兼容并填上 Key 后，正在运行的监听会自动改用模型，不必重启。",
+            )
+        self.rewrite_cache[key] = self.fallback_text
+        return self.fallback_text
+
+    def _rewrite_tail(self, new: str) -> str:
+        if self.rewriter is not None and new != self.fallback_text:
+            return "AI"
+        if self.rewriter is None:
+            return "兜底·未调用AI"
+        return "兜底"
 
     def _rewrite_per_sentence(
         self, text: str, sentences: list[str], where: str
@@ -477,7 +500,7 @@ class Cleaner:
                 continue
             changed = True
             pats = "、".join(p for p, rx in self.regexes if rx.search(seg)) or "?"
-            tail = " AI" if self.rewriter and new != FALLBACK_REPLACEMENT else " 兜底"
+            tail = self._rewrite_tail(new).strip()
             self.details.append(
                 f"改写[{where}·句]{tail} 命中『{pats}』：{self._snip(seg)} → {self._snip(new)}"
             )
@@ -491,7 +514,7 @@ class Cleaner:
         new = self._rewrite_one(text)
         if new is None:
             return text, False
-        tail = " AI" if self.rewriter and new != FALLBACK_REPLACEMENT else " 兜底"
+        tail = self._rewrite_tail(new).strip()
         self.details.append(
             f"改写[{where}]{tail} 命中『{pats}』：{self._snip(text)} → {self._snip(new)}"
         )
@@ -861,6 +884,7 @@ class Worker(threading.Thread):
         include_user: bool = False,
         max_ai_calls: int = 0,
         user_ai_only: bool = False,
+        fallback_text: str = "",
     ) -> None:
         super().__init__(daemon=True)
         self.roots = roots
@@ -874,6 +898,10 @@ class Worker(threading.Thread):
         self.ai_backend = ai_backend
         self.openai_cfg = openai_cfg or {}
         self.network_cfg = normalize_network_config(network_cfg)
+        self.fallback_text = (fallback_text or FALLBACK_REPLACEMENT).strip() or FALLBACK_REPLACEMENT
+        self._settings_lock = threading.Lock()
+        self._ai_dirty = False
+        self._rewriter_sig: tuple | None = None
         self.dry_run = dry_run
         self.excludes = excludes or []
         self.log_file = log_file
@@ -918,6 +946,66 @@ class Worker(threading.Thread):
         self._stop_event.set()
 
     # --- 后端选择 ------------------------------------------------------ #
+    def update_ai_settings(
+        self,
+        backend: str,
+        openai_cfg: dict[str, str],
+        network_cfg: dict[str, Any],
+        fallback_text: str,
+    ) -> None:
+        """GUI 线程调用：把最新 AI 设置交给监听线程，不必停止重开。"""
+        with self._settings_lock:
+            self.ai_backend = backend or "none"
+            self.openai_cfg = dict(openai_cfg or {})
+            self.network_cfg = normalize_network_config(network_cfg)
+            text = (fallback_text or FALLBACK_REPLACEMENT).strip() or FALLBACK_REPLACEMENT
+            self.fallback_text = text
+            self.use_ai = self.ai_backend != "none"
+            self._ai_dirty = True
+
+    def _rewriter_signature(self) -> tuple:
+        cfg = self.openai_cfg or {}
+        net = self.network_cfg or {}
+        return (
+            (self.ai_backend or "none").lower(),
+            str(cfg.get("base_url", "")),
+            str(cfg.get("api_key", "")),
+            str(cfg.get("model", "")),
+            str(cfg.get("prompt", "")),
+            str(net.get("network_mode", "")),
+            str(net.get("proxy_host", "")),
+            str(net.get("proxy_port", "")),
+        )
+
+    def _apply_ai_settings(self, cleaner: Cleaner) -> None:
+        with self._settings_lock:
+            if not self._ai_dirty:
+                return
+            self._ai_dirty = False
+            sig = self._rewriter_signature()
+            fallback = self.fallback_text
+            changed = sig != self._rewriter_sig
+            rewriter = self._build_rewriter() if changed else cleaner.rewriter
+            if changed:
+                self._rewriter_sig = sig
+        if cleaner.fallback_text != fallback:
+            cleaner.rewrite_cache.clear()
+            cleaner.fallback_text = fallback
+        if not changed:
+            return
+        old = cleaner.rewriter
+        cleaner.rewriter = rewriter
+        if rewriter is not None and old is None:
+            cleaner.rewrite_cache.clear()
+            cleaner._no_ai_warned = False
+            self.log(
+                "INFO",
+                "AI 改写已接上，后续命中会调用模型。"
+                "已经写成兜底句的旧内容，点「全量扫描历史」会再送给模型。",
+            )
+        elif rewriter is None and old is not None:
+            self.log("WARN", f"AI 改写已断开，后续命中改用兜底句：{fallback}")
+
     def _build_rewriter(self) -> Callable[[str], str] | None:
         """根据 ai_backend 选改写器：openai / anthropic / none。"""
         backend = (self.ai_backend or "none").lower()
@@ -960,9 +1048,11 @@ class Worker(threading.Thread):
             except OSError as exc:
                 self.log_q.put(LogEvent("WARN", f"无法打开落盘日志 {self.log_file}: {exc}"))
         rewriter = self._build_rewriter()
+        self._rewriter_sig = self._rewriter_signature()
         cleaner = Cleaner(
             self.patterns, self.strip_thinking, rewriter, self.log,
             self.include_user, self.max_ai_calls, self.user_ai_only,
+            self.fallback_text,
         )
         self._cleaner = cleaner
         self.log("INFO", f"开始监听 {len(self.roots)} 个根；轮询 {self.poll_interval}s。")
@@ -971,6 +1061,7 @@ class Worker(threading.Thread):
 
         while not self._stop_event.is_set():
             try:
+                self._apply_ai_settings(cleaner)
                 if self._scan_request.is_set():
                     self._scan_request.clear()
                     self.scan_all(cleaner)
@@ -1476,7 +1567,16 @@ class App:
             foreground="#666666",
         ).pack(anchor="w", padx=6, pady=(0, 2))
 
-        ttk.Label(bk, text="改写 Prompt（system）").pack(anchor="w", padx=6, pady=(4, 0))
+        ttk.Label(bk, text="兜底替换文本（只有没调用到 AI 时才用这句）").pack(
+            anchor="w", padx=6, pady=(4, 0)
+        )
+        self.var_fallback = tk.StringVar(
+            value=str(cfg.get("fallback_text") or FALLBACK_REPLACEMENT)
+        )
+        ttk.Entry(bk, textvariable=self.var_fallback).pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(bk, text="改写 Prompt（system，只有调用 AI 时使用）").pack(
+            anchor="w", padx=6, pady=(4, 0)
+        )
         self.prompt_text = tk.Text(bk, height=3, wrap="word")
         self.prompt_text.pack(fill="x", padx=6, pady=(0, 6))
         self.prompt_text.insert("end", cfg.get("prompt", DEFAULT_REWRITE_PROMPT))
@@ -1543,6 +1643,7 @@ class App:
             "model": self.var_model.get().strip() or DEFAULT_OPENAI_MODEL,
             "api_key": self.var_key.get().strip(),
             "prompt": self.prompt_text.get("1.0", "end").strip() or DEFAULT_REWRITE_PROMPT,
+            "fallback_text": self.var_fallback.get().strip() or FALLBACK_REPLACEMENT,
             **self._collect_network(),
         }
 
@@ -1719,6 +1820,7 @@ class App:
             include_user=self.var_user.get(),
             max_ai_calls=max_ai,
             user_ai_only=self.var_user_ai_only.get(),
+            fallback_text=backend_cfg["fallback_text"],
         )
         self.worker.start()
         self.btn_start.config(state="disabled")
@@ -1793,7 +1895,28 @@ class App:
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
+    def _push_running_ai_settings(self) -> None:
+        worker = self.worker
+        if worker is None or not worker.is_alive():
+            return
+        try:
+            cfg = self._collect_backend()
+        except ValueError:
+            return
+        worker.update_ai_settings(
+            cfg["backend"],
+            {
+                "base_url": cfg["base_url"],
+                "api_key": cfg["api_key"],
+                "model": cfg["model"],
+                "prompt": cfg["prompt"],
+            },
+            cfg,
+            cfg["fallback_text"],
+        )
+
     def _poll_log(self) -> None:
+        self._push_running_ai_settings()
         # 限量抽取：一次最多 _LOG_DRAIN_PER_TICK 条，拼成一块只插入一次、只滚动一次
         chunk: list[str] = []
         try:
@@ -1884,6 +2007,7 @@ def _build_cli_worker(args: argparse.Namespace) -> Worker:
         "model": args.model or cfg.get("model", DEFAULT_OPENAI_MODEL),
         "prompt": cfg.get("prompt", DEFAULT_REWRITE_PROMPT),
     }
+    fallback_text = str(cfg.get("fallback_text") or FALLBACK_REPLACEMENT)
     excludes = list(cfg.get("excludes", [])) + list(args.exclude)
     return Worker(
         roots=roots,
@@ -1902,6 +2026,7 @@ def _build_cli_worker(args: argparse.Namespace) -> Worker:
         include_user=args.include_user,
         max_ai_calls=max(0, args.max_ai_calls),
         user_ai_only=not args.all_user,
+        fallback_text=fallback_text,
     )
 
 
