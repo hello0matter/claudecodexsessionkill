@@ -819,10 +819,10 @@ def make_openai_rewriter(
 # 配置读写（保存 AI 后端设置；注意 key 会明文存在 config.json）
 # --------------------------------------------------------------------------- #
 def resolve_api_key(cfg: dict[str, Any] | None = None) -> str:
-    env = os.environ.get("OPENAI_API_KEY", "").strip()
-    if env:
-        return env
-    return str((cfg or {}).get("api_key") or "").strip()
+    saved = str((cfg or {}).get("api_key") or "").strip()
+    if saved:
+        return saved
+    return os.environ.get("OPENAI_API_KEY", "").strip()
 
 
 def load_config() -> dict[str, Any]:
@@ -1518,7 +1518,7 @@ class App:
         self.btn_test.grid(row=1, column=2, sticky="e", padx=4, pady=2)
         ttk.Label(
             bk,
-            text="API Key 会写入用户配置目录。环境变量 OPENAI_API_KEY 优先于已保存的 Key。",
+            text="API Key 会写入用户配置目录，并优先于环境变量 OPENAI_API_KEY。",
             foreground="#666666",
         ).pack(anchor="w", padx=6, pady=(0, 2))
 

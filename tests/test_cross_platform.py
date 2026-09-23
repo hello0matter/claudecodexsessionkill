@@ -21,12 +21,11 @@ class CrossPlatformTests(unittest.TestCase):
         self.assertEqual(saved, {"backend": "openai", "api_key": "secret"})
         self.assertEqual(loaded["api_key"], "secret")
 
-    def test_resolve_api_key_prefers_environment(self):
+    def test_resolve_api_key_prefers_saved_config(self):
         cfg = {"api_key": "saved-key"}
         with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "env-key"}):
-            self.assertEqual(app.resolve_api_key(cfg), "env-key")
-        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
             self.assertEqual(app.resolve_api_key(cfg), "saved-key")
+            self.assertEqual(app.resolve_api_key({}), "env-key")
 
     def test_cli_scan_writes_cleaned_copy(self):
         record = {

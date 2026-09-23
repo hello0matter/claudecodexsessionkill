@@ -86,7 +86,7 @@ SSH 或没有 `$DISPLAY`/Wayland 的环境请直接使用 `scan`/`watch`，无�
 点 **「保存配置」** 或每次「开始监听」时，后端、Base URL、API Key、模型、Prompt 和兜底句都会写入用户配置目录。
 监听已经开始后，改后端或补上 Key 也会自动生效，不必先停掉。
 已经写成兜底句的旧内容，接上 AI 后点 **「全量扫描历史」** 会再送给模型。
-若设置了环境变量 `OPENAI_API_KEY`，它会覆盖已保存的 Key。
+已保存的 API Key 优先。只有配置里没有 Key 时，才使用环境变量 `OPENAI_API_KEY`。
 
 配置目录为 Windows `%APPDATA%\claude-codex-session-cleaner`，Linux
 `${XDG_CONFIG_HOME:-~/.config}/claude-codex-session-cleaner`。
